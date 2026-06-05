@@ -51,9 +51,31 @@ controls it. Set `music_source` to `spotify` (by voice or config) to use it.
   "client_id":     "<your Spotify app client id>",
   "client_secret": "<your Spotify app client secret>",
   "refresh_token": "<OAuth refresh token>",
-  "access_token":  "<filled in / refreshed automatically>"
+  "access_token":  "<filled in / refreshed automatically>",
+
+  "name":    "Ai Pin",
+  "bitrate":  320,
+  "cache":   "/sdcard/aipin_spotify_cache",
+  "binary":  ""
 }
 ```
+
+**Required keys** (Web API auth):
+
+| Key | Notes |
+|-----|-------|
+| `client_id` / `client_secret` | From your Spotify Developer app |
+| `refresh_token` | From a one-time OAuth authorization-code flow (Premium required) |
+| `access_token` | Filled/refreshed automatically by the hook |
+
+**Optional librespot keys** (audio engine — [`SpotifyPlayer.kt`](src/main/kotlin/com/penumbraos/hook/SpotifyPlayer.kt); all have defaults):
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `name` | `"Ai Pin"` | Spotify Connect device name librespot advertises |
+| `bitrate` | `320` | librespot stream bitrate (kbps): 96 / 160 / 320 |
+| `cache` | `/sdcard/aipin_spotify_cache` | librespot cache dir (auto-created) |
+| `binary` | bundled | Override path to the librespot binary; defaults to the `libspotify.so` shipped inside the hook APK's native lib dir |
 
 **Setup (one-time):**
 1. Create an app at the Spotify Developer Dashboard → copy its **Client ID** and **Client Secret**.
