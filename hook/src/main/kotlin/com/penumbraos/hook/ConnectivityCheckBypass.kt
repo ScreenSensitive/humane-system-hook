@@ -1,12 +1,13 @@
 package com.penumbraos.hook
 
+import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.util.Log
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * Replace Humane's custom connectivity check with the standard Android endpoint.
+ * Replace Humane's custom connectivity check with Android's existing network validation state.
  *
  * Humane's [humaneinternal.system.network.NetworkUtils.validateNetworkConnection]
  * does an HTTP GET to `http://connectivity-check.<env>.humane.cloud` and expects
@@ -15,97 +16,193 @@ import java.net.URL
  * report not-connected and the home screen show the offline banner even when
  * the device is online.
  *
- * We replace the implementation with a GET to `connectivitycheck.gstatic.com/generate_204`
- * (Android's standard captive-portal probe), mapping:
- *   - 204                    -> CONNECTED
- *   - 301/302/303/305/307/308 -> WALLED_GARDEN
- *   - other / IOException    -> FAILURE
+ * Android already validates networks in the framework and exposes the result via
+ * [NetworkCapabilities.NET_CAPABILITY_VALIDATED]. Reuse that state instead of
+ * issuing duplicate captive-portal probes from every Humane UI poll.
  */
 object ConnectivityCheckBypass {
 
     private const val TAG = "PenumbraHook"
 
-    private const val PROBE_URL = "http://connectivitycheck.gstatic.com/generate_204"
-    private const val TIMEOUT_MS = 10_000
+    @Volatile
+    private var appContext: Context? = null
 
-    private val REDIRECT_CODES = setOf(301, 302, 303, 305, 307, 308)
+    @Volatile
+    private var lastLoggedStatus: String? = null
 
     fun install(cl: ClassLoader) {
-        val className = "humaneinternal.system.network.NetworkUtils"
-        val clazz = try {
-            cl.loadClass(className)
+        val networkUtilsClassName = "humaneinternal.system.network.NetworkUtils"
+        val networkUtilsClass = try {
+            cl.loadClass(networkUtilsClassName)
         } catch (_: ClassNotFoundException) {
-            Log.w(TAG, "  $className not found, skipping connectivity check bypass")
+            Log.w(TAG, "  $networkUtilsClassName not found, skipping connectivity check bypass")
             return
         }
 
         val resultEnumClass = try {
-            cl.loadClass("$className\$NetworkRequestResult")
+            cl.loadClass("$networkUtilsClassName\$NetworkRequestResult")
         } catch (_: ClassNotFoundException) {
-            Log.w(TAG, "  $className\$NetworkRequestResult not found, skipping")
+            Log.w(TAG, "  $networkUtilsClassName\$NetworkRequestResult not found, skipping")
             return
         }
 
-        val connected = enumValue(resultEnumClass, "CONNECTED") ?: return
-        val failure = enumValue(resultEnumClass, "FAILURE") ?: return
-        val walledGarden = enumValue(resultEnumClass, "WALLED_GARDEN") ?: return
+        // Pre-resolve Humane's NetworkRequestResult enum values once.
+        // Later hooks return these literal enum objects based on Android's current capabilities.
+        val connectedEnumValue = enumValue(resultEnumClass, "CONNECTED") ?: return
+        val failureEnumValue = enumValue(resultEnumClass, "FAILURE") ?: return
+        val walledGardenEnumValue = enumValue(resultEnumClass, "WALLED_GARDEN") ?: return
 
+        hookNetworkUtilsContextCapture(networkUtilsClass)
+        hookValidateNetworkConnection(networkUtilsClass, connectedEnumValue, failureEnumValue, walledGardenEnumValue)
+        hookNetworkMonitor(cl, connectedEnumValue)
+
+        Log.w(TAG, "  Connectivity check now uses Android NetworkCapabilities")
+    }
+
+    private fun hookNetworkUtilsContextCapture(networkUtilsClass: Class<*>) {
         HookUtils.hookMethodBefore(
-            clazz,
+            networkUtilsClass,
+            "validateWifiConnection",
+            arrayOf(Context::class.java),
+        ) { param ->
+            captureContext(param.args.getOrNull(0) as? Context, "NetworkUtils.validateWifiConnection")
+        }
+    }
+
+    private fun hookValidateNetworkConnection(
+        networkUtilsClass: Class<*>,
+        connectedEnumValue: Enum<*>,
+        failureEnumValue: Enum<*>,
+        walledGardenEnumValue: Enum<*>,
+    ) {
+        HookUtils.hookMethodBefore(
+            networkUtilsClass,
             "validateNetworkConnection",
             arrayOf(Network::class.java),
         ) { param ->
             val network = param.args[0] as? Network
             param.result = if (network == null) {
-                failure
+                logStatusChange("FAILURE(null network)")
+                failureEnumValue
             } else {
-                probe(network, connected, failure, walledGarden)
+                classifyNetwork(network, connectedEnumValue, failureEnumValue, walledGardenEnumValue)
             }
         }
-
-        Log.w(TAG, "  Connectivity check redirected to $PROBE_URL")
     }
 
-    private fun enumValue(enumClass: Class<*>, name: String): Any? {
+    private fun hookNetworkMonitor(cl: ClassLoader, connectedEnumValue: Enum<*>) {
+        val networkMonitorClassName = "humaneinternal.system.network.NetworkMonitor"
+        val networkMonitorClass = try {
+            cl.loadClass(networkMonitorClassName)
+        } catch (_: ClassNotFoundException) {
+            Log.w(TAG, "  $networkMonitorClassName not found, skipping NetworkMonitor hooks")
+            return
+        }
+
+        HookUtils.hookMethodBefore(
+            networkMonitorClass,
+            "getSharedInstance",
+            arrayOf(Context::class.java),
+        ) { param ->
+            captureContext(param.args.getOrNull(0) as? Context, "NetworkMonitor.getSharedInstance")
+        }
+
+        HookUtils.hookMethodAfter(
+            networkMonitorClass,
+            "getWifiInternetCheckStatus",
+            emptyArray(),
+        ) { param ->
+            if (networkMonitorHasValidatedWifi(param.thisObject)) {
+                param.result = connectedEnumValue
+                logStatusChange("CONNECTED")
+            }
+        }
+    }
+
+    private fun enumValue(enumClass: Class<*>, name: String): Enum<*>? {
         return try {
             val valueOf = enumClass.getDeclaredMethod("valueOf", String::class.java)
-            valueOf.invoke(null, name)
+            valueOf.invoke(null, name) as? Enum<*>
         } catch (t: Throwable) {
             Log.e(TAG, "  Could not resolve NetworkRequestResult.$name: ${t.message}")
             null
         }
     }
 
-    private fun probe(
+    private fun classifyNetwork(
         network: Network,
-        connected: Any,
-        failure: Any,
-        walledGarden: Any,
-    ): Any {
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = network.openConnection(URL(PROBE_URL)) as HttpURLConnection
-            conn.connectTimeout = TIMEOUT_MS
-            conn.readTimeout = TIMEOUT_MS
-            conn.instanceFollowRedirects = false
-            conn.useCaches = false
-            // Touch the stream like the original implementation does, so that
-            // captive portals which return 200 with HTML don't get classified
-            // as CONNECTED based on a stale code.
-            try { conn.inputStream.close() } catch (_: Throwable) { /* ignored */ }
-            val code = conn.responseCode
-            Log.w(TAG, "Connectivity probe ($PROBE_URL) -> $code")
-            when {
-                code == 204 -> connected
-                code in REDIRECT_CODES -> walledGarden
-                code in 200..299 -> walledGarden // 200 OK from a captive portal
-                else -> failure
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "Connectivity probe failed: ${t.javaClass.simpleName}: ${t.message}")
-            failure
-        } finally {
-            try { conn?.disconnect() } catch (_: Throwable) { /* ignored */ }
+        connectedEnumValue: Enum<*>,
+        failureEnumValue: Enum<*>,
+        walledGardenEnumValue: Enum<*>,
+    ): Enum<*> {
+        val connectivityManager = connectivityManager()
+        if (connectivityManager == null) {
+            logStatusChange("FAILURE(no ConnectivityManager)")
+            return failureEnumValue
         }
+
+        val capabilities = runCatching { connectivityManager.getNetworkCapabilities(network) }
+            .getOrNull()
+            ?: runCatching { connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork) }
+                .getOrNull()
+        if (capabilities == null) {
+            logStatusChange("FAILURE(no capabilities)")
+            return failureEnumValue
+        }
+
+        return when {
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) -> {
+                logStatusChange("CONNECTED")
+                connectedEnumValue
+            }
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) -> {
+                logStatusChange("WALLED_GARDEN")
+                walledGardenEnumValue
+            }
+            else -> {
+                logStatusChange("FAILURE(unvalidated)")
+                failureEnumValue
+            }
+        }
+    }
+
+    private fun connectivityManager(): ConnectivityManager? {
+        val context = appContext ?: return null
+        return runCatching {
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        }.getOrNull()
+    }
+
+    private fun captureContext(context: Context?, source: String) {
+        if (context == null) return
+        val captured = context.applicationContext ?: context
+        if (appContext === captured) return
+        appContext = captured
+        Log.w(TAG, "  Captured connectivity context from $source")
+    }
+
+    private fun networkMonitorHasValidatedWifi(networkMonitor: Any?): Boolean {
+        if (networkMonitor == null) return false
+        return try {
+            val hasInternetMethod = networkMonitor.javaClass.getDeclaredMethod("hasInternet")
+            hasInternetMethod.isAccessible = true
+            val hasInternet = hasInternetMethod.invoke(networkMonitor) as? Boolean ?: false
+            if (!hasInternet) return false
+
+            val connectionTypeMethod = networkMonitor.javaClass.getDeclaredMethod("getCurrentConnectionType")
+            connectionTypeMethod.isAccessible = true
+            val connectionType = connectionTypeMethod.invoke(networkMonitor)
+            val connectionTypeName = (connectionType as? Enum<*>)?.name ?: connectionType?.toString()
+            connectionTypeName == "WIFI"
+        } catch (t: Throwable) {
+            Log.w(TAG, "NetworkMonitor status check failed: ${t.javaClass.simpleName}: ${t.message}")
+            false
+        }
+    }
+
+    private fun logStatusChange(status: String) {
+        if (lastLoggedStatus == status) return
+        lastLoggedStatus = status
+        Log.w(TAG, "Connectivity status via Android capabilities: $status")
     }
 }

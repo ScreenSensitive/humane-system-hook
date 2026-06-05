@@ -57,6 +57,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        // NewPipeExtractor uses API 33+ java.* methods (e.g. URLEncoder.encode(String,
+        // Charset)); the Pin is API 32, so backport them. Same combo Zenith uses.
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -70,4 +73,14 @@ android {
 
 dependencies {
     implementation("com.aliucord:Aliuhook:1.1.4")
+    // PipePipe extractor (NewPipe fork) — extracts YouTube/SoundCloud stream URLs without a
+    // po_token (uses ANDROID_VR/iOS/tvHTML5 innertube clients), which vanilla NewPipe can't do
+    // on the Pin (no WebView). SHADED fat jar: full protobuf-java/okhttp/okio/commons/org.json
+    // are relocated under com.penumbraos.shaded.* so they don't collide with ironman's
+    // protobuf-javalite (the collision -> VerifyError -> bootloop). org.schabi.newpipe.extractor
+    // stays put (MusicHooks uses it). Built via `:extractor:shadowJar` in /tmp/PipePipeExtractor;
+    // okhttp is consumed only by NewPipeDownloader.java (Java, to dodge Kotlin-metadata issues).
+    // See [[humane-pipepipe-extractor]].
+    implementation(files("libs/pipepipe-shaded.jar"))
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs_nio:2.0.4")
 }

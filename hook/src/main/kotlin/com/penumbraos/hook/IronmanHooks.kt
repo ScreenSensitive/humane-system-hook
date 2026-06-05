@@ -1,7 +1,10 @@
 package com.penumbraos.hook
 
 import android.app.Application
+import android.content.Intent
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import de.robv.android.xposed.XC_MethodHook
@@ -23,6 +26,12 @@ object IronmanHooks {
     fun install(cl: ClassLoader) {
         Log.w(TAG, "Installing ironman hooks...")
         Log.w(TAG, "  Mock server: ${ChannelFactoryBypass.MOCK_SERVER_URI}")
+
+        // Bootloop guard: a touchpad-gesture intent that reaches CentralService before
+        // AppController is initialized NPEs (AppController.touchpadActionManager() == null)
+        // and crashes ironman -> restart -> the intent redelivers -> white-LED bootloop.
+        // Suppress that specific early-gesture NPE so ironman survives the startup race.
+        guardGestureCrash(cl)
 
         // Credential hooks must be installed first — without these, ironman
         // crash-loops before ChannelFactory hooks ever get a chance to run.
@@ -65,6 +74,41 @@ object IronmanHooks {
         // Bypass blocking IWlcService.disableTx binder calls
         WirelessChargingBypass.install(cl)
 
+        // Native voice compose-message confirmation ("yes"/"send it"/"send"/"confirm"
+        // -> ConfirmSendMessage; "no"/"cancel" -> CancelSendMessage), intercepted at
+        // the CONFIRMATION cascade stage so it never reaches the dead SYNAPSE/LLM.
+        // Replaces the Frida voice_handlers confirm flow. Does NOT touch emergency-call
+        // or factory-reset confirmation (see VoiceComposeHooks safety notes).
+        VoiceComposeHooks.install(cl)
+
+        // Native catch-me-up + read-message voice commands (deterministic, offline,
+        // counts+who only; content on explicit "read messages [name]"). Emits a
+        // NarrateAction so it never reaches the LLM.
+        VoiceReadHooks.install(cl)
+
+        // Announce incoming texts ("Text from <sender>"), event-driven on the
+        // notification insert (no stale-replay), gated on the announce_text flag.
+        VoiceAnnounceHooks.install(cl)
+
+        // Add native "text <name> <body>" / "tell <name> <body>" compose recognition
+        // (firmware only ships "send message to <name> saying <body>").
+        ComposePatternsHook.install(cl)
+
+        // Native "play <song>" recognition -> PlayMusic(Track=...) so it reaches the
+        // music experience (and our NewPipe provider) instead of the dead cloud.
+        MusicIntentHook.install(cl)
+
+        // Hands-free follow-ups: after a compose prompt ("Send it?" / "What would you
+        // like to say?") re-open the mic so "yes/send/no/edit/<body>" needs no second
+        // touch-and-hold. Gated by the auto_listen flag (default off).
+        AutoListenHooks.install(cl)
+
+        // Spotify engine: runs librespot ("Ai Pin" Connect device) + a local HTTP WAV server
+        // (127.0.0.1:27089) that streams the current track's PCM. The music app's ExoPlayer
+        // plays that URL (MusicHooks returns it for spotify), so Spotify rides the native
+        // pipeline (now-playing/queue/controls). No phone needed.
+        SpotifyControl.install(cl)
+
         Log.w(TAG, "Ironman hooks installed")
     }
 
@@ -84,6 +128,31 @@ object IronmanHooks {
      *
      * We suppress both NPEs so ironman can proceed to the plaintext/redirect path.
      */
+    /**
+     * Suppress the early-gesture NullPointerException in CentralService.dispatchGestureIntent
+     * (AppController not yet initialized). The NPE otherwise escapes onStartCommand and
+     * crash-loops ironman. Dropping the too-early gesture is harmless — once AppController is
+     * up, gestures dispatch normally. Defensive against the startup race regardless of cause.
+     */
+    private fun guardGestureCrash(cl: ClassLoader) {
+        try {
+            val cls = cl.loadClass("humaneinternal.system.CentralService")
+            val m = cls.getDeclaredMethod("dispatchGestureIntent", Intent::class.java)
+            m.isAccessible = true
+            XposedBridge.hookMethod(m, object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (param.throwable is NullPointerException) {
+                        param.throwable = null
+                        Log.w(TAG, "Suppressed early-gesture NPE (AppController not ready) — bootloop guard")
+                    }
+                }
+            })
+            Log.w(TAG, "  Hooked CentralService.dispatchGestureIntent (bootloop guard)")
+        } catch (t: Throwable) {
+            Log.e(TAG, "  guardGestureCrash failed: ${t.message}")
+        }
+    }
+
     private fun hookCredentialManager(cl: ClassLoader) {
         val className = "humaneinternal.system.credentials.AbstractCredentialKeyManager"
         val clazz = try {
@@ -167,6 +236,21 @@ object IronmanHooks {
                     } catch (t: Throwable) {
                         Log.e(TAG, "Provisioning fix failed (non-fatal)", t)
                     }
+                    // Native compose recognition: rebuild RegexIntentEngine's
+                    // ComposeMessage patterns with the user's contacts.
+                    try {
+                        scheduleContactsRefresh(app)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Contacts-refresh scheduling failed (non-fatal)", t)
+                    }
+                    // Boot-persist the on-demand hooks (dialer/music): the injector's
+                    // boot mutation doesn't take for processes that start on-demand, so
+                    // ironman (always hooked) fires the same INJECT the manual step does.
+                    try {
+                        scheduleHookInjects(app)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Hook-inject scheduling failed (non-fatal)", t)
+                    }
                 }
             })
             Log.w(TAG, "  Hooked MainApplication.onCreate() for provisioning fix")
@@ -193,6 +277,66 @@ object IronmanHooks {
             } catch (t2: Throwable) {
                 Log.e(TAG, "  Failed to hook Application.onCreate() fallback: ${t2.message}")
             }
+        }
+    }
+
+    /**
+     * Native compose recognition: fire NOTIFY_CONTACTS_LIST_CHANGE so ironman's
+     * RegexInterpreter.ContactsChanged() re-reads the on-device contacts DB and
+     * rebuilds the ComposeMessage regex WITH the user's real contact names — then
+     * "send message to <contact> saying <body>" matches in the REGEX stage (no LLM).
+     *
+     * Contacts sync (via PenumbraOS ContactsHooks) lands asynchronously after boot,
+     * and the regex engine may have compiled before they arrived. We re-fire a few
+     * times so a late sync still gets picked up. This replaces the manual
+     * PinFrida.refreshContacts the control app fired from the phone.
+     */
+    /**
+     * Boot-persist the on-demand experience hooks. The injector's boot-time PMS
+     * mutation doesn't reliably take for packages that start ON DEMAND (dialer when
+     * a call rings, music when you say "play") — only a force-restart inject works.
+     * So ironman (which IS hooked at every boot) fires the same INJECT broadcast the
+     * manual step uses, for each on-demand target, a few seconds after boot. This is
+     * the "bundle the inject into the hook" — no manual adb step, ever.
+     *
+     * InjectReceiver is exported with action com.penumbraos.hook.INJECT (verified),
+     * so an explicit-component broadcast from ironman reaches it in system_server.
+     */
+    private fun scheduleHookInjects(app: Application) {
+        val targets = listOf("humane.experience.dialer", "humane.experience.music")
+        val handler = Handler(Looper.getMainLooper())
+        for (delayMs in longArrayOf(12_000L, 45_000L)) {
+            handler.postDelayed({
+                for (pkg in targets) {
+                    try {
+                        val intent = Intent("com.penumbraos.hook.INJECT")
+                            .setClassName(
+                                "com.penumbraos.hook.injector",
+                                "com.penumbraos.hook.injector.InjectReceiver"
+                            )
+                            .putExtra("package", pkg)
+                        app.sendBroadcast(intent)
+                        Log.w(TAG, "Fired INJECT for $pkg (boot-persist on-demand hook)")
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "  INJECT broadcast for $pkg failed: ${t.message}")
+                    }
+                }
+            }, delayMs)
+        }
+    }
+
+    private fun scheduleContactsRefresh(app: Application) {
+        val action = "humaneinternal.system.contacts.NOTIFY_CONTACTS_LIST_CHANGE"
+        val handler = Handler(Looper.getMainLooper())
+        for (delayMs in longArrayOf(20_000L, 60_000L, 150_000L)) {
+            handler.postDelayed({
+                try {
+                    app.sendBroadcast(Intent(action))
+                    Log.w(TAG, "Fired NOTIFY_CONTACTS_LIST_CHANGE (native compose recognition)")
+                } catch (t: Throwable) {
+                    Log.e(TAG, "  contacts broadcast failed: ${t.message}")
+                }
+            }, delayMs)
         }
     }
 

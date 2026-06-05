@@ -39,6 +39,8 @@ class HookComponentFactory : AppComponentFactory() {
             "humane.experience.systemnavigation.SystemNavigationExperience" to SystemNavigationHooks::install,
             "humane.experience.settings.SettingsExperience" to SettingsHooks::install,
             "humane.connectivity.esimlpa.factoryService" to EsimLpaHooks::install,
+            "humane.experience.dialer.DialerExperience" to DialerHooks::install,
+            "humane.experience.music.MusicExperience" to MusicHooks::install,
         )
     }
 
