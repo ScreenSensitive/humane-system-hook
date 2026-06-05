@@ -95,7 +95,30 @@ controls it. Set `music_source` to `spotify` (by voice or config) to use it.
 
 ## 3. `aipin_playlists.json` — playlists
 
-Imported playlists used by `"play <name> playlist"`. Written by the control app.
+Imported playlists, played by voice: `"play <name> playlist"`. The hook
+([`MusicHooks.loadPlaylist`](src/main/kotlin/com/penumbraos/hook/MusicHooks.kt))
+matches the spoken name against the keys (case-insensitive, with substring fallback)
+and plays the tracks; each track is resolved lazily via search at play time.
+
+**Format** — a map of `playlist name → array of tracks`, where each track is
+`{ "t": <title>, "a": <artist> }`:
+
+```json
+{
+  "Workout": [
+    { "t": "Stronger", "a": "Kanye West" },
+    { "t": "Till I Collapse", "a": "Eminem" }
+  ],
+  "Chill": [
+    { "t": "Redbone", "a": "Childish Gambino" }
+  ]
+}
+```
+
+**How it's populated:** the hook only *reads* this file. Producing it (e.g. exporting a
+Spotify playlist via **Exportify** to CSV and converting it to the shape above) is done by
+the companion control app — that import workflow is **out of scope for this hook repo**.
+To use playlists without the app, write this file by hand.
 
 ---
 
@@ -111,8 +134,15 @@ the device's dead SYNAPSE/LLM path. Music commands live in
 Writes `music_source` on-device and confirms aloud ("Switched music to SoundCloud."). No app needed.
 
 ### Play
-> "play <song>" · "play songs by <artist>" · "play <name> playlist" · "play music" (top-hits radio)
+> "play <song>" · "play songs by <artist>" · "play music" (top-hits radio)
 > "play radio of <song>" · "play more like this" / "play similar"
+
+### Play a playlist
+Plays an imported playlist from `aipin_playlists.json` (see §3). Accepted phrasings:
+> "play <name> playlist" · "play my <name> playlist" · "start the <name> playlist"
+> "put on <name> playlist" · "play playlist <name>"
+
+Checked **before** song-name matching, so "play workout playlist" is never treated as a track search.
 
 ### Playback controls
 > pause · resume / continue · next / skip · previous / go back
